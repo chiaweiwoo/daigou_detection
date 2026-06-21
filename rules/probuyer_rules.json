@@ -36,11 +36,11 @@
     },
     {
       "rule_id": "R005",
-      "name": "High cancellation ratio",
-      "feature": "cancellation_ratio",
+      "name": "High repeat SKU buying",
+      "feature": "repeat_sku_ratio",
       "operator": ">=",
       "threshold_source": "p95",
-      "risk_reason": "Customer has unusually high cancellation or return-like behavior."
+      "risk_reason": "Customer repeatedly buys the same SKUs, consistent with restocking or resale."
     }
   ]
 }

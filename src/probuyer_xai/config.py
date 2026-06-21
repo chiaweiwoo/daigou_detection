@@ -58,7 +58,10 @@ MODEL_FEATURES = [
     "spend_per_active_day",
     "bulk_invoice_count",
     "bulk_invoice_ratio",
-    "cancellation_ratio",
+    # cancellation_ratio deliberately excluded: high cancellation is a fraud/return
+    # signal, not a daigou signal. Daigou buyers keep what they buy. Including it
+    # caused the model to flag return-abusers as probuyers.
+    # Cancellation columns are still in the feature matrix for context-only display.
 ]
 
 # --- Risk band thresholds (percentile of anomaly score) ----------------------

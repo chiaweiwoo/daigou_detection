@@ -35,7 +35,11 @@ def _classify_anomaly_type(row: pd.Series) -> str:
     return "broad_wholesale_buyer"
 
 
-def _confidence(risk_band: str, rule_count: int) -> str:
+def _confidence(risk_band: str, rule_count: int, anomaly_type: str = "") -> str:
+    # Cancellation anomalies are a different risk type (fraud/return), not daigou.
+    # Always Low confidence as probuyer risk regardless of model score or rule hits.
+    if anomaly_type == "return_or_cancellation_anomaly":
+        return "Low"
     if risk_band == "High" and rule_count >= 2:
         return "High"
     if risk_band in ("High", "Medium") and rule_count >= 1:
@@ -52,6 +56,11 @@ def _top_reasons(row: pd.Series, rule_reasons: list[str]) -> list[str]:
 
 
 def _recommended_action(risk_band: str, anomaly_type: str) -> str:
+    if anomaly_type == "return_or_cancellation_anomaly":
+        return (
+            "Review for return abuse or speculative ordering — NOT probuyer-like behaviour. "
+            "Escalate to fraud or customer care team if pattern is confirmed."
+        )
     if risk_band == "High":
         return (
             "Flag for business review. Verify customer intent before granting rebate "
@@ -91,8 +100,12 @@ def build_evidence(
         .merge(scores[["customer_id", "anomaly_score", "risk_percentile", "risk_band"]], on="customer_id", how="left")
         .merge(rule_hits[["customer_id", "rule_hits", "rule_reasons", "rule_count"]], on="customer_id", how="left")
     )
-    merged["rule_hits"] = merged["rule_hits"].apply(lambda x: x if isinstance(x, list) else [])
-    merged["rule_reasons"] = merged["rule_reasons"].apply(lambda x: x if isinstance(x, list) else [])
+    merged["rule_hits"] = merged["rule_hits"].apply(
+        lambda x: list(x) if hasattr(x, "__iter__") and not isinstance(x, str) else []
+    )
+    merged["rule_reasons"] = merged["rule_reasons"].apply(
+        lambda x: list(x) if hasattr(x, "__iter__") and not isinstance(x, str) else []
+    )
     merged["rule_count"] = merged["rule_count"].fillna(0).astype(int)
 
     # Attach p90 columns for anomaly type logic
@@ -102,7 +115,7 @@ def build_evidence(
     evidences = []
     for _, row in merged.iterrows():
         anomaly_type = _classify_anomaly_type(row)
-        confidence = _confidence(row["risk_band"], row["rule_count"])
+        confidence = _confidence(row["risk_band"], row["rule_count"], anomaly_type)
         evidence = {
             "customer_id": str(row["customer_id"]),
             "risk_band": row["risk_band"],
