@@ -109,7 +109,7 @@ def main():
 
     page = st.sidebar.radio(
         "Navigate",
-        ["Overview", "Customer Investigation", "What-if Simulator", "Case Studies"],
+        ["Overview", "Customer Investigation", "What-if Simulator", "Case Studies", "Model Calibration"],
     )
 
     features = _load_features()
@@ -124,6 +124,8 @@ def main():
         _page_whatif(features, scores, rule_hits)
     elif page == "Case Studies":
         _page_case_studies()
+    elif page == "Model Calibration":
+        _page_calibration()
 
 
 # --- Page 1: Overview -------------------------------------------------------
@@ -358,6 +360,99 @@ def _page_case_studies():
         )
         return
     st.markdown(p.read_text(encoding="utf-8"))
+
+
+# --- Page 5: Model Calibration ----------------------------------------------
+
+def _page_calibration():
+    st.title("Model Calibration")
+    st.caption(
+        "An independent pro LLM rates sampled customers on probuyer-likeness (1–5, temperature=0). "
+        "Agreement between the LLM's score and the model's risk band is the calibration signal."
+    )
+
+    from probuyer_xai.calibrate import load_report
+
+    report = load_report()
+
+    if report is None:
+        st.info(
+            "No calibration report found. Run:\n\n"
+            "```\nuv run python scripts/07_calibrate_model.py\n```"
+        )
+        return
+
+    mode_label = "Mock (no API key)" if report.is_mock else report.model_used
+    st.caption(f"Iteration {report.iteration} · {report.timestamp[:10]} · Model: {mode_label}")
+
+    # Overall agreement metric
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Overall agreement", f"{report.overall_agreement:.1%}")
+    for col, bc in zip([col2, col3, col4], report.by_band):
+        col.metric(f"{bc.band} band", f"{bc.agreement_rate:.1%}", f"{bc.agreed}/{bc.sampled} rated")
+
+    # Per-band agreement bar chart
+    st.subheader("Agreement by risk band")
+    band_data = {
+        "Band": [bc.band for bc in report.by_band],
+        "Agreement": [bc.agreement_rate for bc in report.by_band],
+        "Sampled": [bc.sampled for bc in report.by_band],
+    }
+    fig = px.bar(
+        band_data,
+        x="Band",
+        y="Agreement",
+        color="Band",
+        color_discrete_map={"High": "#e74c3c", "Medium": "#f39c12", "Low": "#2ecc71"},
+        text=[f"{r:.0%}" for r in band_data["Agreement"]],
+        range_y=[0, 1],
+        labels={"Agreement": "Agreement Rate"},
+    )
+    fig.update_traces(textposition="outside")
+    fig.add_hline(y=0.7, line_dash="dash", line_color="gray", annotation_text="70% target")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # LLM score distribution
+    st.subheader("LLM score distribution")
+    score_data = pd.DataFrame([
+        {"Band": r.model_band, "LLM Score": r.llm_score, "Agrees": r.agrees_with_model}
+        for r in report.raw_ratings
+    ])
+    if not score_data.empty:
+        fig2 = px.histogram(
+            score_data,
+            x="LLM Score",
+            color="Band",
+            color_discrete_map={"High": "#e74c3c", "Medium": "#f39c12", "Low": "#2ecc71"},
+            barmode="group",
+            nbins=5,
+            range_x=[0.5, 5.5],
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Suggested adjustments
+    st.subheader("Suggested adjustments")
+    for s in report.suggested_adjustments:
+        st.warning(s)
+
+    # Disagreement cases
+    all_disagreements = [r for bc in report.by_band for r in bc.disagreements]
+    if all_disagreements:
+        st.subheader(f"Disagreement cases ({len(all_disagreements)})")
+        st.caption("Customers where the LLM's probuyer rating diverges from the model's risk band.")
+        rows = []
+        for r in all_disagreements:
+            rows.append({
+                "Customer ID": r.customer_id,
+                "Model band": r.model_band,
+                "LLM score": r.llm_score,
+                "Primary signal": r.primary_signal or "—",
+                "Disqualifiers": "; ".join(r.disqualifiers[:2]),
+                "LLM confidence": r.rating_confidence,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.success("No disagreement cases — all sampled customers agree with the model's rating.")
 
 
 if __name__ == "__main__":

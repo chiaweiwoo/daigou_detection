@@ -72,3 +72,13 @@ RISK_MED_PCT = 97.0    # top 1–3% → Medium  (everything else → Low)
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+# --- Calibration -------------------------------------------------------------
+# Use a stronger model for calibration — it acts as an independent judge.
+# DeepSeek-V3 ("deepseek-chat") is the default; override with CALIBRATION_MODEL.
+CALIBRATION_MODEL = os.getenv("CALIBRATION_MODEL", "deepseek-chat")
+CALIBRATION_SAMPLE_HIGH = int(os.getenv("CALIBRATION_SAMPLE_HIGH", "15"))
+CALIBRATION_SAMPLE_MED = int(os.getenv("CALIBRATION_SAMPLE_MED", "10"))
+CALIBRATION_SAMPLE_LOW = int(os.getenv("CALIBRATION_SAMPLE_LOW", "5"))
+CUSTOMER_EVIDENCE = DATA_PROCESSED / "customer_evidence.json"
+CALIBRATION_REPORT = DATA_PROCESSED / "calibration_report.json"

@@ -66,7 +66,9 @@ def run_all(skip_download: bool = False) -> bool:
     # Step 6: Build explanation evidence
     print("\n[6/7] Building explanation evidence ...")
     from probuyer_xai.explain import build_evidence
+    from probuyer_xai.calibrate import save_evidence
     evidences = build_evidence(features, scores, rule_hits)
+    save_evidence(evidences)
     print(f"  Evidence built for {len(evidences):,} customers")
 
     # Step 7: Generate case studies
@@ -79,6 +81,7 @@ def run_all(skip_download: bool = False) -> bool:
     print("Pipeline complete!")
     print(f"  Customers analysed: {len(features):,}")
     print(f"  High risk: {high_n} | Medium risk: {med_n}")
-    print(f"  Run dashboard: uv run streamlit run app/dashboard.py")
+    print(f"  Run calibration: uv run python scripts/07_calibrate_model.py")
+    print(f"  Run dashboard:   uv run streamlit run app/dashboard.py")
     print("=" * 60)
     return True
