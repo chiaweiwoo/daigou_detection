@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Data (raw/processed) — too large for git
+data/raw/
+data/interim/
+data/processed/
+
+# Model artifacts
+models/*.joblib
+models/model_metadata.json
+models/feature_metadata.json
+
+# Reports (generated)
+reports/*.md
+
+# Streamlit cache
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+.python-version
