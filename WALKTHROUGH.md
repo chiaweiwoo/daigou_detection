@@ -1,659 +1,519 @@
 # Technical Walkthrough — Retail Probuyer Risk Detection
 
-This document is written for a senior engineer reading the codebase cold. It explains
-what every module does line by line in terms of logic, not just intent. It covers the
-decisions made, the trade-offs considered, and the things deliberately left out.
+This document is the single source of truth for understanding the codebase. It is written
+for someone new to the project who wants to know what every part does, why it was built
+that way, and where to find it.
 
 ---
 
-## 1. What this project is actually doing
+## What this project does
 
-The core problem: a retailer suspects that some customers are professional bulk buyers
-(daigou / probuyers) who drain stock before ordinary consumers can buy. There is no
-ground-truth label. You cannot train a classifier. You can only observe the purchasing
-behaviour and flag customers whose pattern is statistically rare.
+It identifies retail customers whose purchasing behaviour looks wholesale-like or
+probuyer-like — think: someone buying 5,000 units of one item across many invoices,
+consistent with resale rather than personal use. No ground-truth labels exist for this,
+so the detection is unsupervised. The result is a risk score per customer, plain-English
+explanations a business reviewer can act on, and a dashboard to explore the findings.
 
-The solution is a two-layer system:
-
-**Layer 1 — Anomaly detection (deterministic):** HBOS scores each customer purely from
-their transactional features. The DS layer assigns a risk band. Five percentile-based
-business rules independently check for specific extreme behaviours. These two signals —
-model score and rule hits — are merged into a structured evidence dict per customer.
-Nothing probabilistic or LLM-driven happens here.
-
-**Layer 2 — Explanation (generative):** The evidence dict is serialised to JSON and sent
-to DeepSeek. The LLM narrates it in business English. It does not score, rank, or decide
-anything. If the API is unavailable, a deterministic mock template fills in.
-
-Everything in layer 1 is reproducible from the same data. Layer 2 is cosmetic.
+This is a portfolio project using public data (UCI Online Retail, 2010–2011 UK retailer).
+It is not a production system and does not use real company data or real daigou labels.
 
 ---
 
-## 2. Repository layout and what each file owns
+## System architecture
+
+```
+Raw transactions (UCI xlsx)
+        │
+        ▼
+┌─────────────────────────────────┐
+│  DATA LAYER                     │
+│  data.py  →  features.py        │  Clean, standardise, build customer features
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│  SCORING LAYER                  │
+│  model.py  +  rules.py          │  HBOS anomaly score + business rule hits
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│  EXPLANATION LAYER              │
+│  explain.py  →  llm.py          │  Deterministic evidence → LLM narrates it
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│  CALIBRATION LAYER              │
+│  calibrate.py                   │  Pro LLM validates model agreement per-band
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│  INTERFACE                      │
+│  app/dashboard.py               │  Streamlit, 5 pages
+└─────────────────────────────────┘
+```
+
+**The core principle:** the DS/rule layer decides risk. The LLM only explains.
+Risk scores, percentile thresholds, and rule hits are computed deterministically
+before the LLM is ever called.
+
+---
+
+## How to run
+
+```bash
+# One-time setup
+uv python pin 3.11
+uv sync
+cp .env.example .env          # fill in DEEPSEEK_API_KEY for live LLM (optional)
+
+# Full pipeline: download → clean → features → model → rules → explain → cases → calibrate
+uv run python scripts/06_run_all.py
+
+# Dashboard
+uv run streamlit run app/dashboard.py
+
+# Tests (no dataset or API key needed)
+uv run pytest
+
+# Re-run calibration only (without retraining)
+uv run python scripts/07_calibrate_model.py
+```
+
+Everything works without a DeepSeek key — mock explanations replace live LLM calls.
+
+---
+
+## Repository layout
 
 ```
 daigou_detection/
-├── src/probuyer_xai/
-│   ├── config.py        all paths, feature lists, thresholds, env loading
-│   ├── data.py          download, load xlsx, clean, save parquets
-│   ├── features.py      customer-level feature engineering (23 features)
-│   ├── model.py         HBOS training, scoring, artifact persistence
-│   ├── rules.py         rule engine: load JSON, compute thresholds, apply
-│   ├── explain.py       deterministic evidence dict per customer (no LLM)
-│   ├── llm.py           DeepSeek wrapper + mock fallback
-│   ├── whatif.py        5 policy scenario functions (pure Python)
-│   ├── reporting.py     case study selection and report generation
-│   └── pipeline.py      orchestrates all 7 steps in sequence
+├── src/probuyer_xai/       Core library
+│   ├── config.py           Central config: all paths, constants, env vars
+│   ├── data.py             Download, load, clean raw transactions
+│   ├── features.py         Customer-level feature engineering
+│   ├── model.py            HBOS training, anomaly scoring, risk bands
+│   ├── rules.py            Business rule application engine
+│   ├── explain.py          Deterministic evidence builder (no LLM)
+│   ├── llm.py              LLM wrapper with mock fallback
+│   ├── whatif.py           Policy scenario analysis (deterministic)
+│   ├── reporting.py        Case study generation
+│   ├── calibrate.py        LLM-as-judge calibration loop
+│   └── pipeline.py         Orchestrate all 8 steps
 ├── scripts/
 │   ├── 01_download_data.py
 │   ├── 02_prepare_data.py
 │   ├── 03_train_model.py
 │   ├── 04_generate_rules.py
 │   ├── 05_generate_case_studies.py
-│   └── 06_run_all.py    calls pipeline.run_all()
-├── app/
-│   └── dashboard.py     4-page Streamlit app
-├── rules/
-│   └── probuyer_rules.json   version-controlled rule definitions
-├── data/
-│   ├── raw/             Online Retail.xlsx (gitignored)
-│   └── processed/       parquets: clean, normal, features, scores, rule_hits
-├── models/              hbos_model.joblib, feature_scaler.joblib, metadata.json
-└── tests/               28 pytest tests, all synthetic
+│   ├── 06_run_all.py       Entry point — runs everything
+│   └── 07_calibrate_model.py  Standalone calibration re-run
+├── app/dashboard.py        Streamlit, 5 pages
+├── rules/probuyer_rules.json   Version-controlled rule definitions
+├── calibration/history.md      Experiment log (calibration iterations)
+├── tests/                  Synthetic pytest tests (no external deps)
+├── data/                   Gitignored — raw xlsx + processed parquets
+├── models/                 Gitignored — HBOS joblib artifacts
+└── reports/                Gitignored — regenerated markdown reports
 ```
 
 ---
 
-## 3. Config (`src/probuyer_xai/config.py`)
+## Module deep-dives
 
-Everything that would otherwise be a magic string or number lives here. This is the only
-file that calls `load_dotenv()`, so `.env` is read exactly once at import time. All other
-modules import constants from here — they never call `os.getenv` directly.
+### `src/probuyer_xai/config.py`
 
-Key constants a senior should know:
+Single source of truth for every path, constant, and env var. Nothing is hardcoded
+elsewhere — all magic numbers live here.
 
-- `ROOT` is resolved via `Path(__file__).resolve().parents[2]` — two levels up from
-  `src/probuyer_xai/`, landing at the repo root. This makes paths work regardless of
-  where you invoke the script from.
-
-- `MODEL_FEATURES` is a hard list of 17 feature names. This list is the single source of
-  truth for what goes into HBOS. If you add a feature to `features.py` but not here, it
-  will not be used by the model. If you add it here but not in `features.py`, training
-  will fail with a KeyError.
-
-- `RISK_HIGH_PCT = 99.0` and `RISK_MED_PCT = 97.0` are the only thresholds that control
-  the High/Medium/Low band assignment. They are percentile cutoffs on the anomaly score
-  distribution. Top 1% = High, 1–3% = Medium, rest = Low.
-
-- LLM credentials (`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`) are read
-  from env. If `DEEPSEEK_API_KEY` is empty, the LLM layer falls back to mock mode. The
-  model name `deepseek-v4-flash` is kept exactly as specified — it is not validated.
+Key constants:
+- `ROOT` — resolves the repo root from `__file__` using `parents[2]`
+- `MODEL_FEATURES` — the 16 features the HBOS model trains on (see why `cancellation_ratio`
+  is excluded in the comment; including it caused the model to flag fraud/return-abusers
+  as probuyers)
+- `RISK_HIGH_PCT = 99.0`, `RISK_MED_PCT = 97.0` — percentile cutoffs for risk bands;
+  these values were validated by the calibration loop (see `calibration/history.md`)
+- `CALIBRATION_MODEL = "deepseek-chat"` — the pro model (DeepSeek-V3) used as an
+  independent judge; kept separate from `DEEPSEEK_MODEL` (the flash model used for
+  explanations)
 
 ---
 
-## 4. Data layer (`src/probuyer_xai/data.py`)
+### `src/probuyer_xai/data.py`
 
-### Download
+**Download** (`download_raw`): fetches the UCI Online Retail xlsx to `data/raw/`.
+On failure, cleans up the partial file and prints the exact manual-placement path.
+Does not raise — returns `False` so the pipeline can handle it gracefully.
 
-`download_raw()` tries `urllib.request.urlretrieve` against the UCI ML repository URL.
-It is intentionally simple — no retry logic, no progress bar. If it fails (timeout,
-firewall, the UCI server being down), it returns `False` and the caller is responsible
-for printing the manual instruction. It cleans up a partial file if the download failed
-mid-stream.
+**Load** (`load_raw`): reads the xlsx with explicit `dtype` overrides. This matters:
+`StockCode` contains both integers and alphanumeric codes (`"85123A"`). Without
+`dtype={"StockCode": str}`, pandas infers a mixed type that pyarrow refuses to
+serialize to parquet.
 
-### Loading
+**Clean** (`clean`): standardises column names to snake_case, drops rows missing
+a `customer_id`, parses invoice dates, computes `amount = quantity * unit_price`,
+and adds `is_cancelled = invoice_no.startswith("C") OR quantity < 0`.
 
-`load_raw()` reads the xlsx with `pd.read_excel`. Three columns are forced to `str` at
-read time: `CustomerID`, `InvoiceNo`, and `StockCode`. This matters because:
+Returns two DataFrames:
+- `transactions_clean` — all rows including cancellations (406,829 rows)
+- `transactions_normal` — positive qty, positive price, has customer_id (397,884 rows)
 
-- `CustomerID` in the raw file is stored as a float (e.g. 17850.0). Pandas would read
-  it as float64, and `.astype(str)` would produce `"17850.0"`. Forcing `dtype=str` at
-  read time gives `"17850"`.
-- `StockCode` has both numeric codes (e.g. `71053`) and alphanumeric codes (e.g.
-  `85123A`). If pandas infers the type, it reads numeric-looking rows as int and then
-  pyarrow refuses to serialise the mixed-type column to parquet. The explicit `dtype=str`
-  prevents this bug — we hit it once and fixed it here.
-- `InvoiceNo` starts with `C` for cancellations but is otherwise numeric. Same issue.
-
-After reading, `.str.strip()` is applied to all three to remove any trailing whitespace
-from the xlsx.
-
-### Cleaning
-
-`clean()` produces two DataFrames from the same input:
-
-**`transactions_clean`** — everything with a `customer_id`, with `amount` and
-`is_cancelled` added. This is the complete dataset including returns and cancellations.
-It is kept because cancellation features are computed from this frame, not from
-`transactions_normal`.
-
-**`transactions_normal`** — the subset where `is_cancelled` is False, `quantity > 0`,
-and `unit_price > 0`. This is what flows into feature engineering for purchasing behaviour.
-
-The `is_cancelled` flag is true if `invoice_no` starts with `"C"` OR `quantity < 0`.
-Both conditions exist in the data: some cancellation rows use the `C` prefix, some use
-negative quantities without the prefix. We need both checks to catch all of them.
-
-The reason we keep the cancelled rows in a separate frame rather than just dropping them
-is that the cancellation ratio is a meaningful signal — a customer who cancels a lot of
-orders is either testing availability or is a return-prone bulk buyer. We compute that
-feature from `transactions_clean` by cross-referencing the customer's normal purchase
-count.
-
-Real pipeline output: 540,455 raw rows → 406,829 with customer_id → 397,884 normal
-purchases → 4,371 customers (4,338 after dropping those with NaN in model features).
+The two are kept separate because cancellation features need the full set, but
+volume/spend features should only be computed on normal purchases.
 
 ---
 
-## 5. Feature engineering (`src/probuyer_xai/features.py`)
+### `src/probuyer_xai/features.py`
 
-This is the most logic-dense file. It takes the two clean DataFrames and produces one
-row per customer with 23 columns. 17 of those go into the HBOS model. The other 6 are
-kept for explanation and reporting.
+Aggregates 23 features to one row per customer. Built from `transactions_normal`
+for volume/spend, from `transactions_clean` for cancellation context.
 
-### What each feature actually measures
+**Invoice-level first, then customer-level.** Most per-invoice metrics
+(avg basket size, max basket size) are computed by grouping by
+`(customer_id, invoice_no)` first, then aggregating to customer level. This prevents
+multi-line invoices from inflating counts.
 
-**Volume features** (go into model):
-- `total_quantity` — sum of all item quantities across all normal invoices
-- `total_spend` — sum of `amount = quantity * unit_price`
-- `num_invoices` — count of distinct invoice numbers (not row count)
-- `active_days` — `(last_invoice_date - first_invoice_date).days + 1`, minimum 1
+**Feature groups:**
 
-The `+1` in active_days prevents division by zero for customers who placed all their
-orders on a single day. The `max(..., 1)` is the safety net.
+| Group | Features | What they capture |
+|---|---|---|
+| Volume | `total_quantity`, `total_spend`, `num_invoices` | Raw scale of buying |
+| Basket size | `avg_quantity_per_invoice`, `max_quantity_per_invoice`, `avg_spend_per_invoice`, `max_spend_per_invoice` | How large individual orders are |
+| Activity | `active_days`, `quantity_per_active_day`, `spend_per_active_day` | Buying intensity over time |
+| SKU diversity | `unique_skus`, `repeat_sku_ratio`, `top_sku_quantity_share`, `top_sku_spend_share` | How concentrated buying is |
+| Bulk invoices | `bulk_invoice_count`, `bulk_invoice_ratio` | Share of orders above the bulk threshold |
+| Cancellations | `cancellation_ratio` | Kept in the feature matrix for context display, excluded from model |
 
-**Per-invoice stats** (go into model):
-- `avg_quantity_per_invoice`, `max_quantity_per_invoice`
-- `avg_spend_per_invoice`, `max_spend_per_invoice`
+**Bulk threshold:** the 95th percentile of invoice-level total quantity across all
+invoices in the dataset. Stored in `data/processed/feature_metadata.json` so the
+dashboard can display it without retraining. At run time: ~778 units per invoice.
 
-These are computed at the invoice level first, then aggregated. The correct way to
-compute these is to group by `(customer_id, invoice_no)` first, then sum quantity/amount
-per invoice, then take the mean/max across invoices. If you grouped by `customer_id` and
-took the mean of line-level quantities, you'd get the average line quantity, which is a
-different number entirely (one invoice can have many line items). The code does this
-correctly via `inv_qty_by_cust`.
+**`repeat_sku_ratio`:** fraction of unique SKUs a customer bought more than once,
+clipped to [0,1]. Probuyers who restock for resale show high values here.
 
-**SKU diversity features** (go into model):
-- `unique_skus` — number of distinct `stock_code` values
-- `repeat_sku_ratio` — fraction of SKUs bought more than once:
-  `(number of SKUs with purchase count > 1) / unique_skus`.
-  Implemented by counting `(customer_id, stock_code)` rows (each row is a line item, so
-  >1 row = bought on multiple invoices or multiple times on one invoice), then dividing
-  by `unique_skus`. Clipped to [0, 1]. Filled to 0 for customers with no repeat SKUs
-  rather than NaN.
+**`top_sku_quantity_share`:** `max_sku_quantity / total_quantity`. A value near 1.0
+means almost all purchases are one SKU — classic single-product bulk buyer pattern.
 
-**SKU concentration features** (go into model):
-- `top_sku_quantity_share` — what fraction of the customer's total quantity came from
-  their single highest-volume SKU. Computed as `max SKU quantity / total_quantity`.
-  A customer who bought 10,000 units of one SKU and 200 units of everything else has a
-  share close to 1.0.
-- `top_sku_spend_share` — same logic but for spend. The two can differ if the top-volume
-  SKU is cheap and the top-spend SKU is expensive.
-
-**Rate features** (go into model):
-- `quantity_per_active_day` = `total_quantity / active_days`
-- `spend_per_active_day` = `total_spend / active_days`
-
-These normalise volume by time window. A customer who bought 5,000 units over 2 years
-is different from one who bought 5,000 units in 3 days.
-
-**Bulk invoice features** (go into model):
-- Bulk threshold is the **95th percentile of invoice-level total quantity** across all
-  invoices in the dataset, not just one customer's invoices. This gives a dataset-wide
-  reference point. If the p95 invoice-quantity is 778 units, any invoice above that is
-  "bulk". This threshold is stored in `feature_metadata.json` so rules can reference it
-  later.
-- `bulk_invoice_count` — number of the customer's invoices that exceed the threshold.
-  Customers with no bulk invoices get 0 (via `reindex(..., fill_value=0)`).
-- `bulk_invoice_ratio` = `bulk_invoice_count / num_invoices`. Clipped to [0, 1].
-
-**Cancellation features** (NOT in model, kept for explanation):
-- `cancelled_invoice_count`, `cancelled_quantity_abs`, `cancelled_amount_abs` — pulled
-  from `transactions_clean` by filtering `is_cancelled == True` and grouping by
-  `customer_id`. Customers with no cancellations get 0 via `fillna(0)`.
-- `cancellation_ratio` = `cancelled_invoice_count / num_invoices`. Note the denominator
-  is the normal purchase invoice count, not a total. A customer with 10 normal invoices
-  and 4 returns has ratio 0.4.
-
-`cancellation_ratio` is in `MODEL_FEATURES` even though the raw cancellation counts are
-not. The ratio is scale-invariant; the raw counts are not.
-
-**Date bookmarks** (not in model, kept for context):
-- `first_purchase_date`, `last_purchase_date` — used in dashboard's transaction table.
-
-### Safety nets
-
-After assembly, two things happen:
-1. `replace([inf, -inf], np.nan)` — rate features can produce inf if `active_days` or
-   `num_invoices` somehow ends up at zero. The `max(..., 1)` in active_days should
-   prevent this, but it's defensive.
-2. `dropna(subset=MODEL_FEATURES)` — drops the 33 customers who ended up with NaN in
-   any model feature. In practice these are customers in `transactions_normal` but not in
-   the groups used to compute some features (edge case in the `cancellation_ratio`
-   join). Logged to stdout.
+**Why `cancellation_ratio` is excluded from `MODEL_FEATURES`:** daigou buyers keep
+what they buy; high cancellation is a fraud or speculative-ordering signal, not a
+probuyer signal. Including it caused the model to rank high-cancellation customers
+as High-risk probuyers, which was wrong. The feature is retained in the DataFrame
+for downstream display and anomaly type classification but is not fed to HBOS.
 
 ---
 
-## 6. HBOS model (`src/probuyer_xai/model.py`)
+### `src/probuyer_xai/model.py`
 
-### Why HBOS
+**Preprocessing chain:**
+1. `log1p` transform on all 16 model features — handles the right-skewed distributions
+   typical of retail quantity/spend data (a few customers have 100× the median)
+2. `RobustScaler` — centres on the median and scales by IQR, making the transform
+   resistant to the outliers we're deliberately trying to flag
+3. `HBOS` from `pyod` — Histogram-Based Outlier Score; builds one histogram per feature,
+   scores each data point by the inverse of the density at its bin
 
-HBOS (Histogram-Based Outlier Score) works by building a histogram for each feature
-independently, then scoring each data point by summing the negative log-densities of the
-bins it falls into. Points in sparse bins (rare combinations) get high scores.
+**Risk band assignment:**
 
-Three reasons it was chosen over alternatives:
+```python
+risk_percentile = np.sum(raw_scores <= s) / n * 100   # empirical CDF, 0–100
+risk_band: >= RISK_HIGH_PCT → "High", >= RISK_MED_PCT → "Medium", else → "Low"
+```
 
-1. **No label dependency.** There are no ground-truth daigou labels. HBOS is fully
-   unsupervised.
-2. **Handles extreme right skew.** Retail purchasing features (total quantity, spend)
-   follow power-law distributions. HBOS captures this: a customer who bought 80,000 units
-   falls into a very sparse bin and gets a high score without any tuning.
-3. **Feature independence assumption.** HBOS scores features independently and sums the
-   log-densities. This is a simplification (features are correlated), but for the flagging
-   use case it is acceptable. A more correct model would be Isolation Forest or LOF, but
-   HBOS is simpler to explain to a business audience.
+A critical bug that was fixed: `_assign_risk_band` originally returned a pandas
+Series indexed by `customer_id`. Assigning it to `scores` (integer-indexed) caused
+pandas to silently fill everything with NaN — resulting in 0 High and 0 Medium
+customers. Fixed by operating on `np.ndarray` and returning a plain `list[str]`.
 
-### Preprocessing pipeline
+**Saved artifacts:** `models/hbos_model.joblib`, `models/feature_scaler.joblib`,
+`data/processed/customer_scores.parquet` (customer_id, anomaly_score, risk_percentile,
+risk_band), `models/model_metadata.json`.
 
-1. **`log1p` transform.** All model features are non-negative and right-skewed. Taking
-   `log(1 + x)` compresses the scale so that the difference between 100 and 1,000 units
-   is treated comparably to the difference between 1 and 10. Without this, the dense
-   low-value region would dominate the histograms.
-
-2. **`RobustScaler`.** Subtracts the median and divides by the IQR. Unlike `StandardScaler`,
-   it is not pulled by extreme outliers (which are exactly what we're looking for).
-   The scaler is fitted here and saved separately — it must be applied consistently to
-   any new data scored against this model.
-
-3. **`HBOS()`.** Default hyperparameters from pyod. No contamination fraction set —
-   contamination controls what fraction of the training set is assumed to be anomalous,
-   and we do not know this. Risk bands are assigned post-hoc via percentile cutoffs.
-
-### Risk band assignment
-
-`_compute_risk_percentile()` computes for each customer the fraction of all scores that
-are <= their score, scaled to 0–100. This is the empirical CDF of the anomaly score
-distribution. The top customer has percentile 100.0.
-
-`_assign_risk_band()` takes those percentile values as a numpy array and returns a list
-of strings. **Why a plain list and not a pandas Series with an index?** There was a bug
-in the first implementation where `_assign_risk_band` returned a Series indexed by
-`customer_id`, but `scores` was indexed by integer position. When pandas tried to assign
-it, the index mismatch silently filled everything with NaN, producing 0 High and 0 Medium
-customers. The fix was to operate on numpy arrays, bypassing index alignment entirely.
-
-### Artifacts saved
-
-- `hbos_model.joblib` — the fitted HBOS instance
-- `feature_scaler.joblib` — the fitted RobustScaler
-- `customer_scores.parquet` — one row per customer with `customer_id`, `anomaly_score`,
-  `risk_percentile`, `risk_band`
-- `model_metadata.json` — training date, feature list, thresholds, counts. Useful for
-  auditing whether the loaded model matches the current feature set.
+**Results on UCI data:** 4,338 customers scored. 44 High-risk (top 1%), 87 Medium-risk
+(top 1–3%), 4,207 Low-risk.
 
 ---
 
-## 7. Business rules (`rules/probuyer_rules.json` + `src/probuyer_xai/rules.py`)
+### `rules/probuyer_rules.json` + `src/probuyer_xai/rules.py`
 
-### Why rules exist alongside the model
-
-The HBOS score is a single number. It tells you how anomalous a customer is but not
-which dimension is anomalous. A customer could score high because they buy a lot
-(quantity), buy one thing (SKU concentration), cancel a lot (returns), or some
-combination. The business rules make the specific reason explicit and version-controllable.
-
-The rules are stored in `rules/probuyer_rules.json` and checked into git. This means:
-- The rule logic is auditable and reviewable without touching Python code.
-- Rules can be rerun against existing features without retraining the model.
-- A business analyst can propose a rule change as a JSON diff.
-
-### How the rule engine works
-
-`apply_rules()` iterates over the 5 rules in the JSON. For each rule:
-
-1. Look up the feature column (e.g. `total_quantity`).
-2. Resolve `threshold_source` (e.g. `"p99"`) to an integer percentile via `_PCT_MAP`.
-3. Compute `np.percentile(features[feature].dropna().values, pct)` — the threshold is
-   derived fresh from the current feature distribution, not hardcoded. This means
-   thresholds auto-adjust if you retrain on a different dataset slice.
-4. Apply the operator (`>=`, `>`, etc.) via Python's `operator` module to the full
-   feature column. Returns the index of matching customers.
-5. Append the rule ID and reason string to each matching customer's hit record.
-
-Output: one row per customer with `rule_hits` (list of rule IDs), `rule_reasons` (list
-of human-readable strings), `rule_count` (integer). Customers with zero hits have empty
-lists.
-
-### The 5 rules and their threshold levels
-
-| Rule | Feature | Threshold | Why this level |
-|------|---------|-----------|----------------|
-| R001 | `total_quantity` | p99 | Only the most extreme total buyers — p95 would flag 200+ customers |
-| R002 | `max_quantity_per_invoice` | p99 | One enormous basket is a strong signal |
-| R003 | `bulk_invoice_ratio` | p95 | p99 for a ratio feature is too restrictive |
-| R004 | `top_sku_quantity_share` | p95 | SKU concentration is common in B2B, p99 was too tight |
-| R005 | `cancellation_ratio` | p95 | High cancellations are common; p95 catches genuine anomalies |
-
----
-
-## 8. Explanation layer (`src/probuyer_xai/explain.py`)
-
-This layer runs entirely in Python. No LLM, no randomness. It produces a structured
-`dict` per customer that the LLM then narrates.
-
-### Anomaly type classification (`_classify_anomaly_type`)
-
-Uses p90 thresholds (computed from the live feature distribution) as internal reference
-points. The classification logic has a **priority order**:
-
-1. `return_or_cancellation_anomaly` — checked first. If cancellation ratio is above p90,
-   this type is assigned regardless of other signals. This is intentional: cancellation
-   anomalies are a distinct pattern and should be clearly separated from pure bulk buyers.
-2. `single_product_bulk_buyer` — high SKU concentration (>=0.7) combined with high
-   quantity OR high max invoice quantity.
-3. `broad_wholesale_buyer` — high quantity AND high spend but NOT high SKU concentration.
-   This is the classic B2B pattern: many different SKUs in large volumes.
-4. `high_frequency_buyer` — many invoices relative to the population.
-5. `potential_stockout_risk` — high max invoice or high SKU concentration alone.
-6. Default fallback: `broad_wholesale_buyer`.
-
-The 0.7 hardcoded threshold for high SKU concentration in the anomaly type logic is
-separate from the R004 rule threshold (p95 of `top_sku_quantity_share`). The p95
-threshold controls the rule hit; 0.7 is a human-readable "mostly one SKU" cutoff for
-labelling the anomaly type. They serve different purposes.
-
-### Confidence scoring (`_confidence`)
-
-| Condition | Confidence |
-|-----------|------------|
-| High band + ≥2 rule hits | High |
-| High or Medium band + ≥1 rule hit | Medium |
-| Anything else | Low |
-
-A customer can have a High risk band from the model but Low confidence if no business
-rule independently confirms the pattern. This is intentional: the model may flag a
-customer for reasons that aren't cleanly captured by the 5 rules. Low confidence with
-High band means "worth a look, but weaker evidence."
-
-### Evidence dict structure
+Rules are stored as data, not code. This means you can add or modify a rule without
+touching Python.
 
 ```json
 {
-  "customer_id": "15749",
-  "risk_band": "High",
-  "risk_percentile": 100.0,
-  "anomaly_score": 0.8421,
-  "anomaly_type": "broad_wholesale_buyer",
-  "confidence": "High",
-  "top_reasons": ["Customer purchased unusually high total quantity.", ...],
-  "rule_hits": ["R001", "R002", "R003"],
-  "rule_count": 3,
-  "key_metrics": {
-    "total_quantity": 18028.0,
-    "total_spend": 27549.65,
-    "num_invoices": 3,
-    "max_quantity_per_invoice": 9014.0,
-    "bulk_invoice_ratio": 1.0,
-    "top_sku_quantity_share": 0.5,
-    "cancellation_ratio": 0.667
-  },
-  "recommended_action": "Flag for business review. ..."
+  "rule_id": "R001",
+  "feature": "total_quantity",
+  "operator": ">=",
+  "threshold_source": "p99"
 }
 ```
 
-This dict is the interface between the DS layer and the LLM. The LLM is only ever given
-this dict — never the raw feature matrix or the anomaly score directly.
+Five rules:
+- **R001** `total_quantity >= p99` — extreme total volume
+- **R002** `max_quantity_per_invoice >= p99` — at least one enormous order
+- **R003** `bulk_invoice_ratio >= p95` — most orders are bulk-sized
+- **R004** `top_sku_quantity_share >= p95` — buying is highly concentrated on one SKU
+- **R005** `repeat_sku_ratio >= p95` — repeatedly buying the same SKUs (restocking pattern)
+
+R005 was originally `cancellation_ratio >= p95`, which was wrong for the same reason
+the feature was removed from the model — it flagged return-abusers as probuyers.
+Changed to `repeat_sku_ratio`, a genuine resale signal.
+
+`apply_rules` in `rules.py` computes each rule's threshold from the live customer
+feature distribution, then evaluates all rules against all customers. Output:
+`data/processed/customer_rule_hits.parquet` with `rule_hits` (list of rule IDs),
+`rule_reasons` (list of explanatory strings), `rule_count`.
+
+Rule hits from 574 customers at `p95`/`p99` thresholds.
 
 ---
 
-## 9. LLM layer (`src/probuyer_xai/llm.py`)
+### `src/probuyer_xai/explain.py`
 
-### Transport
+Builds structured evidence JSON per customer. No LLM involved here — this is fully
+deterministic. The evidence JSON is what the LLM receives as input.
 
-`_call_llm()` makes a raw `requests.post` to `{DEEPSEEK_BASE_URL}/chat/completions` —
-the OpenAI-compatible endpoint. Body is the standard chat completions format with a
-`system` and `user` message. Response is `resp.json()["choices"][0]["message"]["content"]`.
+**Anomaly type classification** (`_classify_anomaly_type`): uses p90 thresholds
+to categorise each customer into one of five types:
+- `return_or_cancellation_anomaly` — checked first; always overrides others
+- `single_product_bulk_buyer` — high SKU concentration + high volume/max-invoice
+- `broad_wholesale_buyer` — high quantity and spend, distributed SKUs
+- `high_frequency_buyer` — unusually many invoices
+- `potential_stockout_risk` — large single orders or high SKU concentration without
+  the volume to qualify for the above
 
-Key parameters: `max_tokens=400`, `temperature=0.3`. Low temperature keeps the output
-consistent across runs (important for reproducibility of case study reports).
+**Confidence scoring** (`_confidence`):
 
-### System prompt design
+```python
+if anomaly_type == "return_or_cancellation_anomaly":  → "Low"  (always)
+if risk_band == "High" and rule_count >= 2:           → "High"
+if risk_band in ("High", "Medium") and rule_count >= 1: → "Medium"
+else:                                                 → "Low"
+```
 
-The system prompt has six explicit constraints:
-1. Only reference provided JSON values — prevent hallucination.
-2. No accusation — say "flagged for review," not "guilty of daigou."
-3. "Probuyer-like" / "wholesale-like" language only — never "confirmed daigou."
-4. Always acknowledge uncertainty.
-5. 3–5 sentences unless asked for more.
-6. Plain business English.
+Confidence requires both model score (risk band) and rule corroboration. A
+High-band customer with zero rule hits gets only Medium confidence.
+A cancellation anomaly gets Low regardless of model score.
 
-These constraints exist because an LLM given a customer's anomaly score and no guardrails
-will often write with false certainty ("this customer is definitely a daigou reseller").
-The system prompt forces hedge language. The prompt injection risk is low because the
-input is structured JSON from our own pipeline, not user-supplied text.
+**Recommended action:** cancellation anomalies are directed to fraud/care team, not
+the probuyer review queue. This was a deliberate design decision to avoid routing
+fraud cases through a probuyer workflow.
 
-### Mock fallback
-
-`_mock_explanation()` is called when `DEEPSEEK_API_KEY` is empty or the HTTP call raises
-any exception. It produces a templated string from the evidence dict's values — no API
-call, no randomness. The dashboard never crashes because of a missing key.
-
-The three mock task types are `"customer"` (individual explanation), `"summary"` (case
-study), and `"whatif"` (policy scenario). Each has its own template that pulls different
-fields from the evidence dict.
-
-### Four LLM functions
-
-- `explain_customer(evidence)` — explain why one customer is flagged. Used in dashboard
-  Customer Investigation page on demand.
-- `summarise_case(evidence)` — write a case study summary. Used by `reporting.py` at
-  pipeline run time.
-- `explain_whatif(whatif_result)` — narrate the result of a policy simulation. Used in
-  dashboard What-if Simulator page.
-- `monthly_portfolio_summary(evidences)` — takes the full evidence list, computes the
-  breakdown by band and anomaly type in Python, sends the summary stats to the LLM. Not
-  currently wired into the dashboard but available as a library function.
+**A parquet edge case that was fixed:** `rule_hits` is stored as a list column.
+When read back from parquet, list columns arrive as numpy arrays, not Python lists.
+`isinstance(x, list)` fails silently. Fixed: `lambda x: list(x) if hasattr(x, "__iter__") and not isinstance(x, str) else []`.
 
 ---
 
-## 10. What-if analysis (`src/probuyer_xai/whatif.py`)
+### `src/probuyer_xai/llm.py`
 
-### Core abstraction
+Wraps DeepSeek via raw `requests.post` to the OpenAI-compatible `/chat/completions`
+endpoint. The system prompt (`_SYSTEM_PROMPT`) is the governing document for LLM
+behaviour and was written to close four specific audit gaps:
 
-All 5 scenario functions call the same private function `_flagged_ids()`, which walks
-the scores DataFrame and the evidence list, applying filters in this order:
+1. **Confidence-aware output** — if `confidence = "Low"` or `anomaly_type = "return_or_cancellation_anomaly"`,
+   the LLM must lead with a caveat that this is NOT a probuyer pattern
+2. **Language constraint** — always respond in English (data descriptions can be
+   in any language)
+3. **Scope disclaimer** — output is advisory; cannot replace human review
+4. **Self-review step** — before responding, the LLM checks whether it cited any
+   number not present in the evidence JSON
 
-1. Percentile threshold: skip if `risk_percentile < med_pct`.
-2. Whitelist: skip if customer is in the whitelist set.
-3. Anomaly type filter: skip if `exclude_cancellation=True` and anomaly type is
-   `return_or_cancellation_anomaly`.
-4. Min rule hits: skip if `rule_count < min_rule_hits`.
+**Mock fallback** (`_mock_explanation`): deterministic template-based text built
+from the evidence JSON. Used when `DEEPSEEK_API_KEY` is empty or the API call fails.
+Three task variants: `"customer"`, `"summary"`, `"whatif"`.
 
-Each public function calls `_base_flagged()` (defaults, no filters) to get the "before"
-set, then calls `_flagged_ids()` with adjusted parameters to get the "after" set. The
-`_result()` helper computes the symmetric difference: `customers_added = after - before`,
-`customers_removed = before - after`.
+**Four public functions:**
+- `explain_customer(evidence)` — per-customer risk explanation
+- `summarise_case(evidence)` — case study narrative
+- `explain_whatif(whatif_result)` — what-if scenario interpretation
+- `monthly_portfolio_summary(evidences)` — portfolio-level summary
 
-This design means every scenario has identical cost (one pass over scores + evidence)
-and the result is always a precise diff — not an approximation.
-
-### Note on `change_bulk_threshold`
-
-This function is more complex than the others because the bulk threshold affects a
-feature that was computed at training time. A proper re-threshold would require
-re-running `features.py` with a new `_BULK_QTY_PCT`. The current implementation
-approximates this: it re-derives `bulk_invoice_ratio` using `max_quantity_per_invoice`
-as a proxy, then intersects with customers already at Medium+ risk. This is a
-deliberate simplification noted in the code comment. For a full re-threshold scenario,
-you'd re-run the pipeline from step 3.
+`_call_llm` uses `max_tokens=400, temperature=0.3` for explanations.
 
 ---
 
-## 11. Case studies (`src/probuyer_xai/reporting.py`)
+### `src/probuyer_xai/calibrate.py`
 
-### Selection logic
+The LLM-as-judge calibration loop. This is where the project goes beyond naive
+hyperparameter tuning to use LLM domain knowledge as a model validation signal.
 
-`_pick_cases()` tries to find three structurally different customers:
+**Problem it solves:** HBOS is unsupervised — there is no ground truth to tell
+you whether the model is flagging the right customers. The calibration loop uses
+a pro LLM (DeepSeek-V3) as an independent judge to rate a sample of customers
+on probuyer-likeness (1–5 scale, `temperature=0`), then measures agreement between
+the LLM's rating and the model's risk band.
 
-**Case 1:** `anomaly_type == "broad_wholesale_buyer"` AND `confidence == "High"`.
-Fallback: any High-band customer. Then take the one with the highest risk percentile.
+**Why `temperature=0`:** at zero temperature, the model is deterministic. A single
+rating per customer is sufficient — no need to average multiple calls.
 
-**Case 2:** `anomaly_type == "single_product_bulk_buyer"`. Fallback: High or Medium band
-AND `top_sku_quantity_share >= 0.6`. Then take the highest risk percentile.
+**Why a separate, stronger model for calibration:** the explanation model
+(`deepseek-v4-flash`) is optimised for speed and cost. The calibration model
+(`deepseek-chat`, DeepSeek-V3) is more capable and acts as an independent judge.
+Using the same model for both explanation and calibration would reduce independence.
 
-**Case 3:** `anomaly_type == "return_or_cancellation_anomaly"`. Fallback: any High or
-Medium band customer with Low confidence (anomaly detected but weak probuyer pattern).
+**Agreement definition:**
+```
+High band   → LLM score ≥ 4 to agree
+Medium band → LLM score ≥ 3 to agree
+Low band    → LLM score ≤ 2 to agree
+```
 
-If the same customer would appear in two cases, the fallback loop picks the next best
-unselected customer from the ranked-by-percentile list. The `used_ids` set prevents
-duplicates.
+**Calibration report** includes: per-band agreement rate, disagreement cases with
+LLM reasoning, and specific threshold adjustment suggestions.
 
-### Why three specific types
-
-The three cases demonstrate that "anomaly" does not mean "probuyer." Case 3 is
-deliberately a customer who has a high anomaly score but a different underlying pattern
-(return abuse, speculative ordering). This is a key part of the portfolio story: the
-system distinguishes between types of outliers and assigns confidence accordingly.
-
----
-
-## 12. Pipeline orchestration (`src/probuyer_xai/pipeline.py`)
-
-`run_all()` imports each module inside the function body, not at module level. This is
-intentional: it means `import probuyer_xai.pipeline` does not import pandas, pyod,
-joblib, etc. at import time. Only the step that is currently running needs its imports.
-This has a minor effect on startup time and a meaningful effect on making tests fast —
-test files that import from `pipeline.py` don't drag in the full ML stack.
-
-The pipeline stops cleanly at step 1 if the dataset is missing (returns `False`, prints
-exact instructions). All other steps are expected to succeed — there is no partial
-recovery beyond that point.
+**Calibration history** is tracked in `calibration/history.md` (version-controlled,
+not regenerated by the pipeline). It records what was found, what was changed, and why.
 
 ---
 
-## 13. Dashboard (`app/dashboard.py`)
+### `calibration/history.md`
 
-### Data loading
+The experiment log. See it for the full story of the two calibration iterations run
+on this dataset. Summary:
 
-All four data loaders (`_load_features`, `_load_scores`, `_load_rule_hits`,
-`_load_normal`) are decorated with `@st.cache_data`. This means Streamlit only reads
-from disk on the first render per session. Subsequent page navigations use the cached
-result. The evidence list is NOT cached because `_build_evidences()` calls
-`build_evidence()` from `explain.py`, which does CPU-bound work each call. It's fast
-enough (~0.5s) that caching it would complicate invalidation.
-
-### Artifact guard
-
-`_check_artifacts()` verifies the three required parquets exist before rendering any
-page. If any is missing, the entire app stops with a clear message and the exact command
-to run. This prevents confusing KeyError or FileNotFoundError messages that Streamlit
-would otherwise surface as a red stack trace.
-
-### Page 1 — Overview
-
-Reads scores directly, computes High/Medium counts, plots a Plotly histogram coloured
-by risk band. Calls `_build_evidences()` to get anomaly types for the donut chart.
-Top-20 table merges `scores` with `rule_hits` on `customer_id` to show rule hit count
-alongside the anomaly score.
-
-### Page 2 — Customer Investigation
-
-Selector is pre-filtered to High and Medium band customers only — you cannot select a
-Low-risk customer for investigation. The LLM explanation is called on-demand when the
-page renders for a given customer. It uses `st.spinner` to block the UI while waiting.
-Sample transactions are pulled from `transactions_normal.parquet` filtered by
-`customer_id`.
-
-### Page 3 — What-if Simulator
-
-Uses `st.radio` to select the scenario type, then renders scenario-specific controls
-(sliders, text input) below. The "Run scenario" button triggers the Python computation
-and LLM explanation. The split-column layout (controls left, results right) means the
-user can see controls and results simultaneously.
-
-A subtle UX decision: the `wl_cid` variable (customer ID to whitelist) is only defined
-in the `elif scenario == "Whitelist a customer"` branch, but the `st.button` block
-references it. Streamlit re-renders from top to bottom each interaction, so by the time
-the button block runs, the variable either exists from the branch above or is not
-referenced (because the scenario is different). This is fine in Streamlit's execution
-model but would be a bug in linear Python.
-
-### Page 4 — Case Studies
-
-Reads `reports/case_studies.md` and renders it with `st.markdown()`. The markdown file
-is generated by `reporting.py` and contains both the structured evidence table and the
-LLM explanation inline. If the file doesn't exist (pipeline not run), it shows an error
-with the exact command.
+- **Iteration 1** (RISK_MED_PCT=97.0): High 93%, Medium 90%, Low 20%. Precise at
+  the top; some real signal leaking into the Low band.
+- **Iteration 2** (RISK_MED_PCT=95.0): High 93%, Medium 60%, Low 60%. Expanding
+  the Medium band overshot — the p95–p97 cohort is too noisy.
+- **Decision:** kept 97.0. At 90% LLM agreement, Medium is an actionable reviewer
+  queue. At 60%, it becomes a "maybe watch" tier with too many false positives.
 
 ---
 
-## 14. Tests (`tests/`)
+### `src/probuyer_xai/whatif.py`
 
-28 tests, all using synthetic DataFrames. No test touches the disk, the network, or the
-LLM API. Each test file corresponds to one source module.
+Five deterministic policy scenario functions. They operate in memory on the scored
+customer DataFrames — no model retraining needed.
 
-**test_data.py (6 tests):** Constructs a 4-row synthetic DataFrame with one cancellation
-(C-prefix) and one negative-quantity row. Tests that: columns are standardised, amount
-is correct, the C-prefix and negative-qty rows are both flagged as cancelled, and
-customers with null `customer_id` are dropped.
+| Function | What it does |
+|---|---|
+| `change_risk_threshold(new_high, new_med)` | Re-assigns bands at new percentile cutoffs |
+| `change_bulk_threshold(new_pct)` | Recomputes bulk features at a new invoice-quantity percentile |
+| `exclude_cancellation_anomalies(...)` | Removes customers whose anomaly type is `return_or_cancellation_anomaly` |
+| `whitelist_customer(customer_id, ...)` | Removes a specific customer from the flagged list |
+| `require_min_rule_hits(n, ...)` | Filters flagged list to customers with ≥ n rule hits |
 
-**test_features.py (6 tests):** Constructs a 6-row DataFrame with 2 customers. Tests
-one-row-per-customer, no infinities, non-negative bulk count, ratios in [0,1], no NaN
-in model features, and that metadata contains the bulk threshold.
-
-**test_rules.py (6 tests):** Uses inline rule definitions (not the file on disk) and a
-50-row synthetic feature DataFrame. Tests that the rule engine returns expected columns,
-that at least one rule triggers on realistic data, that hits are lists, and that a
-deliberately extreme value triggers R001.
-
-**test_explain.py (5 tests):** Builds synthetic features/scores/rule_hits for 20
-customers. Tests required dict fields, the confidence scoring function directly, anomaly
-type validity, customer lookup, and None return for a missing customer.
-
-**test_whatif.py (5 tests):** Builds 20 synthetic customers with known risk percentiles
-and rule counts. Tests that tightening the threshold reduces the count, cancellation
-exclusion removes the right customers, whitelisting a specific customer removes it from
-the result and lists it in `customers_removed`, and that the result dict has all required
-keys.
+Each returns a dict: `{scenario, before_flagged_count, after_flagged_count, customers_added, customers_removed}`.
+The LLM receives this dict and explains the business impact — it does not compute it.
 
 ---
 
-## 15. What we deliberately did not build
+### `src/probuyer_xai/reporting.py`
 
-**No ground-truth labels.** The UCI dataset has no daigou labels and no way to validate
-precision/recall. HBOS is unsupervised. The "accuracy" of this system cannot be measured
-in the traditional ML sense. It is an anomaly detection and business review tool, not a
-classifier.
+Generates `reports/case_studies.md` and `reports/llm_examples.md`.
 
-**No Jupyter notebooks.** They would overlap with the scripts pipeline and become stale.
-The `reports/*.md` files carry the data narrative and are generated fresh on each run.
+`_pick_cases` selects three contrasting customers from the evidence list:
+1. The highest-risk broad wholesale buyer (highest anomaly score with `broad_wholesale_buyer` type)
+2. The top single-product bulk buyer (`single_product_bulk_buyer` type)
+3. A cancellation anomaly (to demonstrate the fraud/return distinction)
 
-**No real-time scoring.** The pipeline is batch. New customers would need to re-run
-from step 3 (features) through step 6 (evidence). The model artifacts are saved and
-reusable, but there is no API endpoint.
-
-**No supervised rule tuning.** The 5 rules use fixed percentile levels (p99, p95).
-In production you would calibrate these against confirmed flagged customers. We have none.
-
-**No multi-retailer or multi-tenant support.** One dataset, one model, one rule set.
-
-**No auth on the dashboard.** It's a showcase tool, not a production app.
+The LLM writes the narrative for each case via `summarise_case`.
+Reports are gitignored — they're regenerated on every pipeline run.
 
 ---
 
-## 16. Key design invariant
+### `app/dashboard.py`
 
-**The DS/rule layer decides risk. The LLM only explains.**
+Five Streamlit pages via `st.sidebar.radio`. All loaders use `@st.cache_data` to
+avoid re-reading parquets on every interaction. Artifacts are checked at startup
+(`_check_artifacts`); if missing, a clear instruction to run the pipeline is shown
+and `st.stop()` is called.
 
-Every function that makes a risk decision — `_assign_risk_band`, `_classify_anomaly_type`,
-`_confidence`, `apply_rules`, `_flagged_ids` — is in Python. None of them call the LLM.
-The LLM receives a completed evidence dict. It can only produce text from it.
+| Page | Key components |
+|---|---|
+| Overview | KPI metrics (total, High, Medium), anomaly score histogram (Plotly), anomaly type donut, top-20 flagged table |
+| Customer Investigation | Customer dropdown (sorted by anomaly score), risk metrics, key metrics table, rule hits, LLM explanation, sample transactions |
+| What-if Simulator | Scenario radio, sliders/inputs, before/after metrics, LLM interpretation |
+| Case Studies | Renders `reports/case_studies.md` directly |
+| Model Calibration | Agreement bar chart, LLM score distribution histogram, adjustment suggestions, disagreement case table |
 
-This means the system is:
-- **Reproducible** — same data, same risk output, every time.
-- **Auditable** — you can inspect the exact evidence dict that the LLM was given.
-- **Resilient** — if DeepSeek is down, the risk decision is still made correctly. Only
-  the explanation text changes (to mock mode).
-- **Not misleading** — the LLM cannot produce a different risk band than the one
-  computed by Python. It cannot say a Low-risk customer is High-risk.
+The Calibration page loads `data/processed/calibration_report.json` via
+`calibrate.load_report()`. If no report exists, it shows an instruction to run
+`scripts/07_calibrate_model.py`.
+
+---
+
+### `src/probuyer_xai/pipeline.py` + `scripts/06_run_all.py`
+
+`pipeline.run_all()` orchestrates all 8 steps with lazy imports (each step's module
+is imported inside the step block, not at module load time). This means the pipeline
+starts fast and fails at the right step if a dependency is missing.
+
+```
+[1/8] Download data
+[2/8] Clean + save parquets
+[3/8] Build customer features
+[4/8] Train HBOS, assign risk bands
+[5/8] Apply business rules
+[6/8] Build explanation evidence  → saves customer_evidence.json
+[7/8] Generate case studies
+[8/8] LLM-as-judge calibration    → saves calibration_report.json
+```
+
+Step 1 fails gracefully: if the download fails, it prints the exact manual path and
+exits with a clear message rather than raising an exception mid-pipeline.
+
+`scripts/06_run_all.py` is just a four-line wrapper that imports `run_all` and calls it.
+
+---
+
+## Tests
+
+44 tests across 6 files. All synthetic — no UCI dataset, no LLM key, no network.
+
+| File | Covers |
+|---|---|
+| `test_data.py` | Column standardisation, amount calculation, cancellation detection |
+| `test_features.py` | One row per customer, no inf/NaN in model features, ratios in [0,1] |
+| `test_rules.py` | Rules JSON loads correctly, rule application columns, synthetic rule trigger |
+| `test_explain.py` | Required evidence fields, confidence logic, anomaly type classification |
+| `test_whatif.py` | Threshold change, whitelist, min-rule-hits filter |
+| `test_calibrate.py` | Agreement logic, mock rating, report save/load round-trip, suggestion generation |
+
+---
+
+## Key design decisions
+
+**1. LLM explains, DS decides.** The LLM never sees raw features or model scores
+before a human-readable evidence JSON is built. The risk band in that JSON is a
+string ("High", "Medium", "Low") computed by percentile cutoffs — not something the
+LLM can influence.
+
+**2. Cancellation ≠ probuyer.** Daigou buyers buy in bulk and keep the goods.
+High cancellation is a fraud or speculative-ordering pattern. This distinction is
+enforced at three layers: `MODEL_FEATURES` (feature excluded), `rules/probuyer_rules.json`
+(R005 uses `repeat_sku_ratio`, not `cancellation_ratio`), and `explain.py`
+(cancellation anomalies get `confidence="Low"` and are routed to fraud/care team).
+
+**3. Percentile thresholds, not magic constants.** Rule thresholds (p95, p99) are
+computed from the live feature distribution each time rules are applied. If the
+customer population shifts, thresholds shift with it. The only hardcoded percentiles
+are `RISK_HIGH_PCT` and `RISK_MED_PCT` in config, and those were validated by
+calibration (see `calibration/history.md`).
+
+**4. Mock mode everywhere.** The LLM is optional. Every LLM call has a
+deterministic fallback. The pipeline, dashboard, and tests all work without a
+DeepSeek key.
+
+**5. Rules as versioned JSON.** `rules/probuyer_rules.json` is committed to git.
+You can see when a rule changed and why. The rule engine reads and applies the JSON
+at runtime — no retraining needed to change a rule.
+
+**6. Calibration as model validation.** Because HBOS is unsupervised, there is no
+precision/recall to compute. Calibration fills that gap: a pro LLM acts as a domain
+expert rating whether flagged customers actually look like probuyers. Two iterations
+converged on `RISK_MED_PCT=97.0` as the operating point (90% LLM agreement on the
+Medium band vs 60% at p95).
+
+---
+
+## Known limitations
+
+- No real daigou labels — validation is LLM-assisted, not ground-truth-based
+- UCI dataset is B2B-heavy; many "flagged" customers are legitimate wholesale buyers
+- HBOS has no notion of time — seasonal buying spikes aren't distinguished from
+  persistent wholesale behaviour
+- Dashboard is a showcase only; no auth, no production deployment
+- LLM calibration uses the same data the model trained on (no held-out set)
