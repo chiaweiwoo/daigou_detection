@@ -1,0 +1,46 @@
+{
+  "version": "v1",
+  "description": "Simple probuyer-like risk rules based on customer-level batch purchasing features.",
+  "rules": [
+    {
+      "rule_id": "R001",
+      "name": "Extreme total quantity",
+      "feature": "total_quantity",
+      "operator": ">=",
+      "threshold_source": "p99",
+      "risk_reason": "Customer purchased unusually high total quantity."
+    },
+    {
+      "rule_id": "R002",
+      "name": "Extreme max invoice quantity",
+      "feature": "max_quantity_per_invoice",
+      "operator": ">=",
+      "threshold_source": "p99",
+      "risk_reason": "Customer had at least one unusually large basket."
+    },
+    {
+      "rule_id": "R003",
+      "name": "High bulk invoice ratio",
+      "feature": "bulk_invoice_ratio",
+      "operator": ">=",
+      "threshold_source": "p95",
+      "risk_reason": "Large share of customer invoices are bulk-like."
+    },
+    {
+      "rule_id": "R004",
+      "name": "High SKU concentration",
+      "feature": "top_sku_quantity_share",
+      "operator": ">=",
+      "threshold_source": "p95",
+      "risk_reason": "Large share of quantity comes from one SKU."
+    },
+    {
+      "rule_id": "R005",
+      "name": "High cancellation ratio",
+      "feature": "cancellation_ratio",
+      "operator": ">=",
+      "threshold_source": "p95",
+      "risk_reason": "Customer has unusually high cancellation or return-like behavior."
+    }
+  ]
+}
