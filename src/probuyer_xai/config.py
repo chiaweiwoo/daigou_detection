@@ -66,7 +66,7 @@ MODEL_FEATURES = [
 
 # --- Risk band thresholds (percentile of anomaly score) ----------------------
 RISK_HIGH_PCT = 99.0   # top 1%  → High
-RISK_MED_PCT = 97.0    # top 1–3% → Medium  (everything else → Low)
+RISK_MED_PCT = 97.0    # top 1–3% → Medium  (95.0 tested in iter-2; 97.0 chosen — see calibration/history.md)
 
 # --- LLM env -----------------------------------------------------------------
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
